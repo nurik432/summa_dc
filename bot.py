@@ -1,6 +1,7 @@
 """
 Телеграм бот для учёта ежедневных начислений
-Записывает данные через Google Apps Script Web App — без credentials.json!
+Записывает данные через Google Apps Script Web App
+Принимает пересланные сообщения в личку
 """
 
 import re
@@ -11,14 +12,15 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date
 
 import httpx
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, MessageHandler, CommandHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
 
 # ============================================================
-# НАСТРОЙКИ — задайте как Secrets на HuggingFace
-# ============================================================
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "")
-APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")  # URL из Deploy → Web App
+APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")
 # ============================================================
 
 logging.basicConfig(
@@ -43,6 +45,17 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", 7860), HealthHandler)
     logger.info("Health server started on port 7860")
     server.serve_forever()
+
+
+# ---------- Кнопки ----------
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Итоги за сегодня", callback_data="today"),
+            InlineKeyboardButton("📅 Итоги за месяц",  callback_data="month"),
+        ]
+    ])
 
 
 # ---------- Google Apps Script ----------
@@ -91,13 +104,41 @@ def parse_message(text: str) -> dict | None:
         return None
 
 
-# ---------- Обработчики бота ----------
+# ---------- Текст итогов ----------
+
+def today_text(d: dict, date_str: str) -> str:
+    return (
+        f"📊 *Итоги за {date_str}*\n"
+        f"Транзакций: `{d['count']}`\n"
+        f"Сумма: `{d['summa']} TJS`\n"
+        f"Комиссия: `{d['komis']} TJS`\n"
+        f"Зачислено: `{d['zachislenie']} TJS`"
+    )
+
+def month_text(d: dict, month_str: str) -> str:
+    return (
+        f"📅 *Итоги за {month_str}*\n"
+        f"Транзакций: `{d['count']}`\n"
+        f"Сумма: `{d['summa']} TJS`\n"
+        f"Комиссия: `{d['komis']} TJS`\n"
+        f"Зачислено: `{d['zachislenie']} TJS`"
+    )
+
+
+# ---------- Обработчики ----------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Пересылай мне сообщения о начислениях.\n\n"
+        "Или нажми кнопку для просмотра статистики:",
+        reply_markup=main_keyboard()
+    )
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.channel_post or update.message
+    message = update.message
     if not message or not message.text:
         return
-
 
     data = parse_message(message.text)
     if not data:
@@ -107,45 +148,68 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result and result.get("ok"):
         logger.info(f"✅ {data['date']} | +{data['zachislenie']} TJS")
+        await message.reply_text(
+            f"✅ Записано: *{data['zachislenie']} TJS* за {data['date']}",
+            parse_mode="Markdown",
+            reply_markup=main_keyboard()
+        )
     else:
         logger.error(f"❌ Ошибка записи: {result}")
+        await message.reply_text("❌ Ошибка записи в таблицу.")
+
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "today":
+        today = date.today().strftime("%d.%m.%Y")
+        result = await sheets_request({"action": "get_today", "date": today})
+        if not result or not result.get("ok") or not result.get("data"):
+            await query.edit_message_text(f"За {today} транзакций пока нет.", reply_markup=main_keyboard())
+        else:
+            await query.edit_message_text(
+                today_text(result["data"], today),
+                parse_mode="Markdown",
+                reply_markup=main_keyboard()
+            )
+
+    elif query.data == "month":
+        month = datetime.now().strftime("%m.%Y")
+        result = await sheets_request({"action": "get_month", "month": month})
+        if not result or not result.get("ok") or not result.get("data"):
+            await query.edit_message_text(f"За {month} данных нет.", reply_markup=main_keyboard())
+        else:
+            await query.edit_message_text(
+                month_text(result["data"], month),
+                parse_mode="Markdown",
+                reply_markup=main_keyboard()
+            )
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = date.today().strftime("%d.%m.%Y")
     result = await sheets_request({"action": "get_today", "date": today})
-
     if not result or not result.get("ok") or not result.get("data"):
-        await update.message.reply_text(f"За {today} транзакций пока нет.")
+        await update.message.reply_text(f"За {today} транзакций пока нет.", reply_markup=main_keyboard())
         return
-
-    d = result["data"]
     await update.message.reply_text(
-        f"📊 *Итоги за {today}*\n"
-        f"Транзакций: `{d['count']}`\n"
-        f"Сумма: `{d['summa']} TJS`\n"
-        f"Комиссия: `{d['komis']} TJS`\n"
-        f"Зачислено: `{d['zachislenie']} TJS`",
-        parse_mode="Markdown"
+        today_text(result["data"], today),
+        parse_mode="Markdown",
+        reply_markup=main_keyboard()
     )
 
 
 async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month = datetime.now().strftime("%m.%Y")
     result = await sheets_request({"action": "get_month", "month": month})
-
     if not result or not result.get("ok") or not result.get("data"):
-        await update.message.reply_text(f"За {month} данных нет.")
+        await update.message.reply_text(f"За {month} данных нет.", reply_markup=main_keyboard())
         return
-
-    d = result["data"]
     await update.message.reply_text(
-        f"📅 *Итоги за {month}*\n"
-        f"Транзакций: `{d['count']}`\n"
-        f"Сумма: `{d['summa']} TJS`\n"
-        f"Комиссия: `{d['komis']} TJS`\n"
-        f"Зачислено: `{d['zachislenie']} TJS`",
-        parse_mode="Markdown"
+        month_text(result["data"], month),
+        parse_mode="Markdown",
+        reply_markup=main_keyboard()
     )
 
 
@@ -160,12 +224,14 @@ def main():
     threading.Thread(target=run_health_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.ALL, handle_message))
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("month", cmd_month))
+    app.add_handler(CallbackQueryHandler(handle_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("🤖 Бот запущен...")
-    app.run_polling(allowed_updates=["message", "channel_post"])
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
